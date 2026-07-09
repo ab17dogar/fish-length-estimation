@@ -1,0 +1,27 @@
+# Python environments
+.venv/
+venv/
+env/
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor / tooling
+.claude/
+.idea/
+.vscode/
+
+# Large dataset (~10GB AutoFish images) — not tracked in git
+data/
+
+# Training-run artifacts (checkpoints, debug/val images, loss curves, eval CSVs)
+# — regenerated per run, not source
+autofish_training_release/length_estimation/cnn/output/
