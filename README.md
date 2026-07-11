@@ -9,16 +9,20 @@ especially under limited labeled-data scenarios.
 ## Repository structure
 
 ```
-autofish_training_release/       # AutoFish training code (pristine authors' code; runs in their CUDA Docker)
+autofish_training_release/       # AutoFish training code (authors' code; only cnn/Model.py extended)
   length_estimation/
     cnn/
-      Model.py                   # MobileNetV2 encoder + MLP head
-      FishLengthDataset.py       # dataset / dataloader
-      train.py                   # training entry point
-      configs/                   # default / baseline / smoke / paper configs
-      output/                    # trained checkpoints (.pt) + loss curves
-    eval_length_estimators.py    # evaluation (CNN + skeletonization approaches)
-    compute_metrics.py           # MAE / MAPE reporting
+      Model.py                   # MobileNetV2 OR DINOv2 (VFM) encoder + MLP head
+      FishLengthDataset.py       # dataset / dataloader (unchanged)
+      train.py                   # training entry point (unchanged)
+      configs/                   # default/baseline/smoke/paper + vfm/vfm_smoke
+        label_efficiency/        # generated reduced-label configs (baseline & VFM)
+      output/                    # trained checkpoints (.pt) + loss curves (gitignored)
+    eval_length_estimators.py    # evaluation (CNN + skeletonization approaches, unchanged)
+    compute_metrics.py           # MAE/MAPE/RMSE/R2/bias per subset/species/fish-id
+    analyze_predictions.py       # failure-case & prediction-bias analysis + plots
+    plot_label_efficiency.py     # MAE-vs-training-data curve (baseline vs VFM)
+    VFM_EXPERIMENTS.md           # VFM variant + full experiment/analysis guide
     camera_calibration/          # camera calibration utilities
   mask2former/                   # instance segmentation + classification
 ODE_fish_length_estimation.md    # ODE protocol documentation
@@ -63,15 +67,39 @@ python eval_length_estimators.py \
 python compute_metrics.py --csv cnn/output/cnn-paper/eval/model/from-gt/eval-output.csv
 ```
 
-The paper reports the REG model at **MAE ≈ 0.99 cm** on the combined test set
-(Table 4); this reproduction targets that figure. `compute_metrics.py` prints
-MAE/MAPE per subset (separated / touching / combined) and per species.
+Since this evaluates on **ground-truth masks** (`--gt_path` only), the target is
+the paper's `REG^gt` result — **MAE 0.82 cm** combined (0.67 separated / 0.96
+touching; Table 4). The widely-quoted 0.62/1.38 cm (and 0.99 cm combined) are
+`REG^pd`, on *predicted* Mask2Former masks — a different condition, reproducible
+by additionally passing `--pred_path`. `compute_metrics.py` reports
+MAE/MAPE/RMSE/R²/median/bias per subset (separated / touching / combined), per
+species, and per fish id.
+
+## VFM variant (encoder swap)
+
+The extension replaces **only the encoder** — MobileNetV2 → a Vision Foundation
+Model (DINOv2 ViT-S/14) — keeping the same MLP head, inputs, data, optimizer,
+loss, and schedule. The single code change is in `cnn/Model.py` (selected by the
+`MODEL_BACKEND` config key; the `mobilenet_v2` path is byte-for-byte the
+original). To keep the comparison honest, the encoder and the training regime
+are separated into a `{MobileNetV2, DINOv2} × {frozen, fine-tuned}` matrix
+(`baseline_frozen.cfg`, `paper.cfg`, `vfm.cfg`, `vfm_finetune.cfg`); the clean
+encoder-only comparison is frozen-vs-frozen (`baseline_frozen` vs `vfm`).
+
+```
+python train.py --config configs/vfm.cfg                # -> output/cnn-vfm/model.pt
+```
+
+The full experiment matrix, the reduced-label study (3 arms × data ladder ×
+random subsets), and the failure/bias analysis are documented in
+[`length_estimation/VFM_EXPERIMENTS.md`](autofish_training_release/length_estimation/VFM_EXPERIMENTS.md).
 
 ## Attribution
 
 The training code and dataset originate from the AutoFish project
 ([vap.aau.dk/autofish](https://vap.aau.dk/autofish/)); see the accompanying paper
-`AutoFish_MACVI_WACV25_vbn.pdf`. The training/eval scripts under
-`autofish_training_release/` are the authors' unmodified code; this repository
-adds reproduction configs (`paper.cfg`, `smoke.cfg`, `baseline.cfg`) and
-evaluation/metric tooling (`compute_metrics.py`).
+`AutoFish_MACVI_WACV25_vbn.pdf`. The scripts under `autofish_training_release/`
+are the authors' code, used unmodified **except** for `cnn/Model.py`, which is
+extended additively to allow a DINOv2 (VFM) encoder alongside the original
+MobileNetV2. This repository also adds reproduction/VFM/label-efficiency configs
+and evaluation/metric tooling (`compute_metrics.py`).
