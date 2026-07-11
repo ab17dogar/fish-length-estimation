@@ -33,6 +33,10 @@
 # =============================================================================
 set -uo pipefail
 
+# Force matplotlib's non-interactive backend so plotting works on a headless
+# server (the Docker run passes -e DISPLAY, which is invalid with no X server).
+export MPLBACKEND=Agg
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../length_estimation
 CNN="$HERE/cnn"
 GT="${GT:-/workspace/autofish_dataset/annotations.json}"
