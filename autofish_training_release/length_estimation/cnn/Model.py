@@ -8,13 +8,21 @@ class DINOv2Encoder(nn.Module):
     """Vision Foundation Model encoder (DINOv2 ViT) used as a drop-in backbone.
 
     This mirrors the role of the MobileNetV2 backbone in the baseline: it maps
-    an RGB image to a single global feature vector. DINOv2 returns the
-    CLS-token embedding, analogous to MobileNetV2's globally-pooled feature.
+    an RGB image to a global feature vector fed to the regression head.
 
-    The rest of the pipeline (FishLengthDataset, train.py, eval) is unchanged,
-    so images still arrive as raw [0, 1] tensors. DINOv2 was pre-trained with
-    ImageNet normalization, so that normalization is applied here, inside the
-    encoder, keeping every VFM-specific detail local to the encoder swap.
+    Readout options (how the ViT token grid is pooled into that vector):
+      * "cls"       — the CLS-token embedding only (D-dim). The original,
+                      minimal analogue of MobileNetV2's pooled feature.
+      * "clspatch"  — concat[CLS, mean(patch tokens), max(patch tokens)] (3D-dim).
+                      The patch tokens form a 16x16 spatial grid that localises
+                      the fish within the crop, which carries the geometric /
+                      extent information a *length* regressor needs but that a
+                      single semantic CLS summary tends to discard. This is the
+                      standard strong readout for dense/geometric downstream
+                      tasks and is our main lever for a competitive VFM.
+
+    Images arrive as raw [0, 1] tensors from FishLengthDataset; DINOv2 was
+    pre-trained with ImageNet normalization, applied here inside the encoder.
     """
 
     # CLS-token embedding dimension per DINOv2 variant.
@@ -24,6 +32,7 @@ class DINOv2Encoder(nn.Module):
         "dinov2_vitl14": 1024,
         "dinov2_vitg14": 1536,
     }
+    _READOUT_MULT = {"cls": 1, "clspatch": 3}
     _IMAGENET_MEAN = [0.485, 0.456, 0.406]
     _IMAGENET_STD = [0.229, 0.224, 0.225]
     # Pin the DINOv2 hub ref to a fixed commit so the architecture (and hence the
@@ -31,18 +40,24 @@ class DINOv2Encoder(nn.Module):
     # container, and future runs — unlike an unpinned 'main' which can drift.
     _HUB_REF = "facebookresearch/dinov2:7764ea0f912e53c92e82eb78a2a1631e92725fc8"
 
-    def __init__(self, model_name, freeze=True):
+    def __init__(self, model_name, freeze=True, readout="cls"):
         super().__init__()
         if model_name not in self._DIMS:
             raise ValueError(
                 f"Unknown DINOv2 variant '{model_name}'. "
                 f"Expected one of {list(self._DIMS)}.")
+        if readout not in self._READOUT_MULT:
+            raise ValueError(
+                f"Unknown readout '{readout}'. "
+                f"Expected one of {list(self._READOUT_MULT)}.")
         # Official DINOv2 weights via torch.hub (needs internet on first run,
         # just like torchvision downloading the MobileNetV2 ImageNet weights).
         # trust_repo=True avoids the interactive trust prompt hanging a
         # non-interactive/`docker run` session.
         self.backbone = torch.hub.load(self._HUB_REF, model_name, trust_repo=True)
-        self.num_features = self._DIMS[model_name]
+        self.readout = readout
+        self.embed_dim = self._DIMS[model_name]
+        self.num_features = self.embed_dim * self._READOUT_MULT[readout]
 
         self.frozen = freeze
         if freeze:
@@ -64,7 +79,142 @@ class DINOv2Encoder(nn.Module):
 
     def forward(self, x):
         x = (x - self.mean) / self.std
-        return self.backbone(x)  # -> [B, num_features] CLS-token embedding
+        if self.readout == "cls":
+            return self.backbone(x)  # -> [B, D] CLS-token embedding
+        # "clspatch": pool the patch-token grid alongside the CLS token.
+        feats = self.backbone.forward_features(x)
+        cls = feats["x_norm_clstoken"]                 # [B, D]
+        patches = feats["x_norm_patchtokens"]          # [B, N, D]
+        return torch.cat(
+            [cls, patches.mean(dim=1), patches.amax(dim=1)], dim=1)  # [B, 3D]
+
+
+class DINOv3Encoder(nn.Module):
+    """DINOv3 ViT encoder (Meta, 2025) — the same role as DINOv2Encoder.
+
+    DINOv3's headline advance over DINOv2 is the quality of its *dense* (patch)
+    features (its "Gram-anchoring" training keeps patch features from degrading),
+    which is exactly what the "clspatch" readout here exploits for the geometric
+    length-estimation signal — so DINOv3 is a natural upgrade for this task.
+
+    Loaded via HuggingFace transformers (weights are license-gated: the HF
+    account must have been granted access and HF_TOKEN must be set). The CLS
+    token and the patch-token grid are read out of ``last_hidden_state``, whose
+    layout is [CLS, <num_register_tokens registers>, <patch tokens>].
+    """
+
+    # short name -> gated HF repo id
+    _REPO = {
+        "dinov3_vits16": "facebook/dinov3-vits16-pretrain-lvd1689m",
+        "dinov3_vits16plus": "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        "dinov3_vitb16": "facebook/dinov3-vitb16-pretrain-lvd1689m",
+        "dinov3_vitl16": "facebook/dinov3-vitl16-pretrain-lvd1689m",
+        "dinov3_vith16plus": "facebook/dinov3-vith16plus-pretrain-lvd1689m",
+        "dinov3_vit7b16": "facebook/dinov3-vit7b16-pretrain-lvd1689m",
+    }
+    _READOUT_MULT = {"cls": 1, "clspatch": 3}
+    _IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    _IMAGENET_STD = [0.229, 0.224, 0.225]
+
+    def __init__(self, model_name, freeze=True, readout="cls"):
+        super().__init__()
+        if model_name not in self._REPO:
+            raise ValueError(
+                f"Unknown DINOv3 variant '{model_name}'. "
+                f"Expected one of {list(self._REPO)}.")
+        if readout not in self._READOUT_MULT:
+            raise ValueError(f"Unknown readout '{readout}'.")
+        from transformers import AutoModel
+        # Gated download; needs prior access grant + HF_TOKEN. Pinned by repo id
+        # (the lvd1689m pretrain checkpoints are the stable released weights).
+        self.backbone = AutoModel.from_pretrained(self._REPO[model_name])
+        self.num_register_tokens = getattr(
+            self.backbone.config, "num_register_tokens", 0)
+        self.embed_dim = self.backbone.config.hidden_size
+        self.readout = readout
+        self.num_features = self.embed_dim * self._READOUT_MULT[readout]
+
+        self.frozen = freeze
+        if freeze:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+        self.register_buffer(
+            "mean", torch.tensor(self._IMAGENET_MEAN).view(1, 3, 1, 1))
+        self.register_buffer(
+            "std", torch.tensor(self._IMAGENET_STD).view(1, 3, 1, 1))
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.frozen:
+            self.backbone.eval()
+        return self
+
+    def forward(self, x):
+        x = (x - self.mean) / self.std
+        h = self.backbone(pixel_values=x).last_hidden_state  # [B, 1+R+N, D]
+        cls = h[:, 0]
+        if self.readout == "cls":
+            return cls
+        patches = h[:, 1 + self.num_register_tokens:]          # [B, N, D]
+        return torch.cat(
+            [cls, patches.mean(dim=1), patches.amax(dim=1)], dim=1)
+
+
+class SupervisedCNNEncoder(nn.Module):
+    """A stronger ImageNet-supervised CNN backbone (ResNet, ConvNeXt, EfficientNet).
+
+    The baseline's MobileNetV2 was chosen for on-vessel efficiency, not accuracy.
+    For a pure accuracy push we allow larger supervised CNNs, whose ImageNet
+    features transfer to the masked crops more readily than DINOv2's semantic
+    self-supervised features (which overfit here). The classifier head is stripped
+    so forward() returns the pooled feature vector, and — unlike the baseline,
+    which feeds raw [0,1] — ImageNet normalization is applied here (these weights
+    expect it), matching how DINOv2Encoder handles its input.
+    """
+    _IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    _IMAGENET_STD = [0.229, 0.224, 0.225]
+
+    def __init__(self, model_name, freeze=False):
+        super().__init__()
+        weights = models.get_model_weights(model_name).DEFAULT
+        backbone = getattr(models, model_name)(weights=weights)
+        # Strip the classification head, recording the feature width.
+        if hasattr(backbone, "fc") and isinstance(backbone.fc, nn.Linear):
+            self.num_features = backbone.fc.in_features           # ResNet
+            backbone.fc = nn.Identity()
+        elif hasattr(backbone, "classifier"):
+            clf = backbone.classifier
+            if isinstance(clf, nn.Sequential):
+                for i in range(len(clf) - 1, -1, -1):             # last Linear
+                    if isinstance(clf[i], nn.Linear):
+                        self.num_features = clf[i].in_features
+                        clf[i] = nn.Identity()
+                        break
+            elif isinstance(clf, nn.Linear):
+                self.num_features = clf.in_features
+                backbone.classifier = nn.Identity()
+        else:
+            raise ValueError(f"Cannot strip head of '{model_name}'.")
+        self.backbone = backbone
+        if freeze:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+        self.register_buffer(
+            "mean", torch.tensor(self._IMAGENET_MEAN).view(1, 3, 1, 1))
+        self.register_buffer(
+            "std", torch.tensor(self._IMAGENET_STD).view(1, 3, 1, 1))
+
+    def forward(self, x):
+        return self.backbone((x - self.mean) / self.std)
+
+
+# torchvision CNNs routed to SupervisedCNNEncoder (mobilenet_v2 keeps its own
+# exact path below for faithful-baseline reproduction).
+_SUPERVISED_CNNS = {
+    "resnet50", "resnet34", "resnet101", "convnext_tiny", "convnext_small",
+    "efficientnet_b0", "efficientnet_b3", "regnet_y_1_6gf",
+}
 
 
 class Model(nn.Module):
@@ -77,7 +227,28 @@ class Model(nn.Module):
             # ----- Vision Foundation Model encoder (drop-in replacement) -----
             # Produces a single global feature vector, just like the pooled
             # MobileNetV2 feature below; the MLP head and inputs are identical.
-            self.features = DINOv2Encoder(model_name, freeze=freeze_backend)
+            #
+            # The readout is encoded as a "-<readout>" suffix on MODEL_BACKEND
+            # (e.g. "dinov2_vits14-clspatch"), so the architecture is fully
+            # determined by that one config string — eval_length_estimators.py,
+            # which only passes MODEL_BACKEND through, rebuilds the exact same
+            # model with no changes on its side. No suffix => "cls" (original).
+            base_name, _, readout = model_name.partition("-")
+            readout = readout or "cls"
+            self.features = DINOv2Encoder(
+                base_name, freeze=freeze_backend, readout=readout)
+            n_inputs = self.features.num_features
+        elif model_name.startswith("dinov3"):
+            # ----- DINOv3 VFM encoder (same readout suffix convention) -------
+            base_name, _, readout = model_name.partition("-")
+            readout = readout or "cls"
+            self.features = DINOv3Encoder(
+                base_name, freeze=freeze_backend, readout=readout)
+            n_inputs = self.features.num_features
+        elif model_name in _SUPERVISED_CNNS:
+            # ----- Larger ImageNet-supervised CNN (accuracy-first) -----------
+            self.features = SupervisedCNNEncoder(
+                model_name, freeze=freeze_backend)
             n_inputs = self.features.num_features
         else:
             model_func = getattr(models, model_name)

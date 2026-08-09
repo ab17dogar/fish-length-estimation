@@ -21,10 +21,15 @@ from FishLengthDataset import FishLengthDataset
 def setup_dataloaders(config, num_workers=7):
     gt_path = config.get("Config", "MASKS_GT")
     pred_path = config.get("Config", "MASKS_PREDICTION", fallback=None)
+    # Per-item segmentation-mask RLE decode makes training data-bound; allow more
+    # workers via config (default 7 = authors' value) so the GPU isn't starved.
+    num_workers = config.getint("Training", "NUM_WORKERS", fallback=num_workers)
 
 
     # Training param
     cache_images = config.getboolean("Training", "CACHE_IMAGES", fallback=False)
+    cache_size_gib = config.getint("Training", "CACHE_SIZE_GIB", fallback=2)
+    resize_to = config.getint("Preprocessing", "RESIZE_TO", fallback=224)
     
     # Pre-processing / formatting
     crop_to_bbox = config.getboolean("Preprocessing", "CROP_TO_BBOX", fallback=False)
@@ -45,6 +50,8 @@ def setup_dataloaders(config, num_workers=7):
                                       normalize_bbox=normalize_bbox,
                                       model_input_plane=model_input_plane,
                                       masking_type=masking_type,
+                                      cache_size_gib=cache_size_gib,
+                                      resize_to=resize_to,
                                       augment_color=config.getboolean("Augmentation", "AUGMENT_COLOR_TRAIN_IMAGES", fallback=False),
                                       augment_crop=config.getboolean("Augmentation", "AUGMENT_CROP_TRAIN_IMAGES", fallback=False)),
             'val':FishLengthDataset(gt_path=gt_path,
@@ -55,12 +62,17 @@ def setup_dataloaders(config, num_workers=7):
                                     model_input_bbox=model_input_bbox,
                                     normalize_bbox=normalize_bbox,
                                     model_input_plane=model_input_plane,
-                                    masking_type=masking_type)}
+                                    masking_type=masking_type,
+                                    cache_size_gib=cache_size_gib,
+                                    resize_to=resize_to)}
 
     # Dataloader iterators
     batch_size = config.getint("Training", "BATCH_SIZE")
+    # drop_last guards the head's BatchNorm1d against a size-1 final batch (which
+    # crashes it) at small batch sizes; default False preserves authors' behaviour.
+    drop_last = config.getboolean("Training", "DROP_LAST", fallback=False)
     dataloaders = {'train': DataLoader(data['train'], batch_size=batch_size,
-                                       pin_memory=False,
+                                       pin_memory=False, drop_last=drop_last,
                                        num_workers=num_workers, shuffle=True),
                    'val': DataLoader(data['val'], batch_size=batch_size,
                                      pin_memory=False,

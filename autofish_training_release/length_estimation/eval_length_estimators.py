@@ -345,7 +345,8 @@ if __name__=="__main__":
                                     masking_type = config.get("Preprocessing", "MASKING_TYPE", fallback=None),
                                     model_input_bbox = config.getboolean("Model", "MODEL_INPUT_BBOX", fallback=False),
                                     model_input_plane = config.getboolean("Model", "MODEL_INPUT_PLANE", fallback=False),
-                                    normalize_bbox = config.getboolean("Model", "NORMALIZE_BBOX", fallback=False))
+                                    normalize_bbox = config.getboolean("Model", "NORMALIZE_BBOX", fallback=False),
+                                    resize_to = config.getint("Preprocessing", "RESIZE_TO", fallback=224))
 
     # Set output csv
     if(args.pred_path is None):

@@ -25,9 +25,21 @@ class FishLengthDataset(Dataset):
                  resize=True, mode="train", use_caching=False,
                  crop_to_bbox=False, model_input_bbox=False,
                  normalize_bbox=False, model_input_plane=False,
-                 masking_type=None, augment_color=False, augment_crop=False):
+                 masking_type=None, augment_color=False, augment_crop=False,
+                 cache_size_gib=2, resize_to=224):
+        # cache_size_gib: RAM budget for the in-memory crop cache. The published
+        # value is 2 GiB, which holds only ~1/3 of the training crops, so most
+        # samples re-decode a full-resolution PNG every epoch (the training
+        # bottleneck). Raising it to fit the whole split makes runs GPU-bound.
+        # Default 2 preserves the authors' behaviour exactly.
+        self.cache_size_gib = cache_size_gib
+        # resize_to: side length of the square crop fed to the encoder. The
+        # baseline uses 224; higher values (e.g. 448, 518 — both multiples of
+        # DINOv2's patch size 14) give a finer patch grid and more geometric
+        # detail for the length measurement. Must stay a multiple of 14 for ViTs.
+        self.resize_to = resize_to
 
-        self.resize = resize # enable/disable resizing to 224x224 for the CNN
+        self.resize = resize # enable/disable resizing for the CNN
         self.mode = mode # "train" for training CNN, "eval" outputs extra information
         
         self.dataset_dir = os.path.dirname(gt_path)
@@ -89,10 +101,10 @@ class FishLengthDataset(Dataset):
         self.cache = None
         if(use_caching):
             dataset_len = len(self.ann_ids)   # number of samples in the full dataset
-            data_dims = (3, 224, 224)   # data dims (not including batch)
+            data_dims = (3, self.resize_to, self.resize_to)   # data dims (not including batch)
 
             self.cache = SharedCache(
-                size_limit_gib=2,
+                size_limit_gib=self.cache_size_gib,
                 dataset_len=dataset_len,
                 data_dims=data_dims,
                 dtype=torch.float32,
@@ -307,9 +319,9 @@ class FishLengthDataset(Dataset):
             if(self.resize):
                 trans = transforms.Compose([
                     transforms.ToTensor(),
-                    transforms.Resize(size=(224,224), antialias=True),
-                ])        
-                image = trans(image)        
+                    transforms.Resize(size=(self.resize_to, self.resize_to), antialias=True),
+                ])
+                image = trans(image)
 
             # update cache
             if(self.cache is not None):
