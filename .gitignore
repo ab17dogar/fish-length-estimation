@@ -25,3 +25,6 @@ data/
 # Training-run artifacts (checkpoints, debug/val images, loss curves, eval CSVs)
 # — regenerated per run, not source
 autofish_training_release/length_estimation/cnn/output/
+
+# Session working note (local only)
+RESUME_HERE.md
